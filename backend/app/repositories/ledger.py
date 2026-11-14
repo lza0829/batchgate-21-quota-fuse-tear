@@ -1,4 +1,4 @@
-"""Billing ledger: one charge row per executed job attempt."""
+"""Billing ledger: one charge row per executed (successful) job attempt."""
 
 from __future__ import annotations
 
@@ -24,7 +24,9 @@ def insert_charge(
     fixed_cost: float | None,
     unit_price: float,
 ) -> int:
-    # Fuse-skip amounts are accepted without filtering; callers may bill any status.
+    # Only executed attempts are billed. Fuse/dependency skips never run and
+    # must not reach this function: the orchestration service is the sole
+    # caller and writes a charge exclusively on success.
     cur = conn.execute(
         """
         INSERT INTO cost_ledger(
@@ -45,28 +47,6 @@ def insert_charge(
         ),
     )
     return int(cur.lastrowid)
-
-
-def insert_projected_charge(
-    conn: sqlite3.Connection,
-    *,
-    orchestration_id: int,
-    job_id: int,
-    attempt_id: int,
-    quote: dict,
-) -> int:
-    """Record a ledger entry for the given attempt quote."""
-    return insert_charge(
-        conn,
-        orchestration_id=orchestration_id,
-        job_id=job_id,
-        attempt_id=attempt_id,
-        amount=float(quote.get("amount") or 0.0),
-        cost_mode=str(quote.get("cost_mode") or "weighted"),
-        cost_weight=float(quote.get("cost_weight") or 0.0),
-        fixed_cost=quote.get("fixed_cost"),
-        unit_price=float(quote.get("unit_price") or 0.0),
-    )
 
 
 def list_charges(

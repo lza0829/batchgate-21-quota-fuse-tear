@@ -193,6 +193,193 @@ def test_cost_settings_persist_across_reconnect(isolated_db):
     assert result["report"]["cost_total"] == 11.5
 
 
+def _fetch_all(sql, params=()):
+    conn = db_module.connect()
+    try:
+        return [dict(r) for r in conn.execute(sql, params).fetchall()]
+    finally:
+        conn.close()
+
+
+def _set_quota(limit: str) -> None:
+    conn = db_module.connect()
+    conn.execute("UPDATE settings SET value=? WHERE key='quota_limit'", (limit,))
+    conn.commit()
+    conn.close()
+
+
+def test_fuse_skips_are_not_billed_and_each_job_has_one_final_attempt(isolated_db):
+    _set_quota("4.00")
+    result = _run()
+    report = result["report"]
+    assert report["fused"] is True
+
+    # one row per job, and no job carries two different final states
+    per_job = _fetch_all(
+        """
+        SELECT job_id, COUNT(*) attempts, COUNT(DISTINCT status) statuses
+        FROM job_attempts WHERE orchestration_id=?
+        GROUP BY job_id
+        """,
+        (result["id"],),
+    )
+    assert len(per_job) == 3
+    assert all(r["attempts"] == 1 and r["statuses"] == 1 for r in per_job)
+    dirty = _fetch_all(
+        """
+        SELECT job_id FROM job_attempts WHERE orchestration_id=?
+        GROUP BY job_id
+        HAVING SUM(status='skipped_fuse') > 0 AND SUM(status='success') > 0
+        """,
+        (result["id"],),
+    )
+    assert dirty == []
+
+    # fuse skips never produce ledger rows; every charge backs a success
+    assert _fetchone(
+        """
+        SELECT COUNT(*) c FROM cost_ledger l
+        JOIN job_attempts a ON a.id=l.attempt_id
+        WHERE a.orchestration_id=? AND a.status='skipped_fuse'
+        """,
+        (result["id"],),
+    )["c"] == 0
+    assert _fetchone(
+        """
+        SELECT COUNT(*) c FROM cost_ledger l
+        JOIN job_attempts a ON a.id=l.attempt_id
+        WHERE a.orchestration_id=? AND a.status!='success'
+        """,
+        (result["id"],),
+    )["c"] == 0
+
+    # skipped attempts carry no execution artifacts — the job never ran
+    for attempt in _fetch_all(
+        "SELECT detail FROM job_attempts WHERE orchestration_id=? AND status='skipped_fuse'",
+        (result["id"],),
+    ):
+        detail = attempt["detail"]
+        assert "watermark_ts" not in detail and "result" not in detail
+
+
+def test_fuse_does_not_move_watermarks_of_skipped_jobs(isolated_db):
+    _set_quota("4.00")
+    result = _run()
+    succeeded = {
+        r["job_name"]
+        for r in _fetch_all(
+            """
+            SELECT j.name job_name FROM job_attempts a JOIN jobs j ON j.id=a.job_id
+            WHERE a.orchestration_id=? AND a.status='success'
+            """,
+            (result["id"],),
+        )
+    }
+    watermarked = {
+        r["job_name"]
+        for r in _fetch_all(
+            """
+            SELECT j.name job_name FROM watermarks w JOIN jobs j ON j.id=w.job_id
+            WHERE w.watermark_ts IS NOT NULL
+            """
+        )
+    }
+    # the watermark set is exactly the set of jobs that actually succeeded
+    assert watermarked == succeeded
+    assert "fact_order_daily" not in watermarked
+    assert result["report"]["watermarked_jobs"] == len(watermarked)
+
+
+def test_fused_report_matches_attempts_ledger_and_reconcile(isolated_db):
+    from app.routers.billing import reconcile
+
+    _set_quota("1.50")
+    result = _run()
+    report = result["report"]
+
+    status_counts = {
+        r["status"]: r["c"]
+        for r in _fetch_all(
+            "SELECT status, COUNT(*) c FROM job_attempts WHERE orchestration_id=? GROUP BY status",
+            (result["id"],),
+        )
+    }
+    assert status_counts.get("success", 0) == report["succeeded"] == 0
+    assert status_counts.get("skipped_fuse", 0) == report["skipped_fuse"] == 3
+    assert report["skipped"] == report["skipped_fuse"] + report["skipped_dep"]
+    assert report["attempt_count"] == sum(status_counts.values())
+
+    charges = _fetch_all(
+        "SELECT amount FROM cost_ledger WHERE orchestration_id=?", (result["id"],)
+    )
+    assert charges == []
+    assert report["ledger_entry_count"] == 0
+    assert report["cost_total"] == 0.0
+
+    check = reconcile(result["id"])
+    assert check["consistent"] is True
+    assert all(item["ok"] for item in check["checks"].values())
+
+
+def test_run_without_quota_bills_every_job_and_advances_every_watermark(isolated_db):
+    from app.routers.billing import reconcile
+
+    result = _run()
+    report = result["report"]
+    assert report["fused"] is False
+    assert report["succeeded"] == 3
+    assert report["skipped_fuse"] == 0
+    assert report["cost_total"] == 6.0
+
+    charges = _fetch_all(
+        "SELECT amount FROM cost_ledger WHERE orchestration_id=?", (result["id"],)
+    )
+    assert sorted(c["amount"] for c in charges) == [1.0, 2.0, 3.0]
+    watermarked = _fetch_all(
+        "SELECT COUNT(*) c FROM watermarks WHERE watermark_ts IS NOT NULL"
+    )[0]["c"]
+    assert watermarked == 3 == report["watermarked_jobs"]
+
+    check = reconcile(result["id"])
+    assert check["consistent"] is True
+
+
+def test_quota_gate_latch_has_precedence_over_budget_fit():
+    from app.engines.cost import quota_gate
+
+    # a latched fuse blocks even affordable jobs and even with no quota limit
+    assert quota_gate(fused=True, remaining=None, projected=0) == "fuse_latched"
+    assert quota_gate(fused=True, remaining=100.0, projected=1.0) == "fuse_latched"
+    assert quota_gate(fused=False, remaining=None, projected=99.0) == "allow"
+    assert quota_gate(fused=False, remaining=5.0, projected=6.0) == "would_exceed"
+    assert quota_gate(fused=False, remaining=5.0, projected=5.0) == "allow"
+
+
+def test_skipped_fuse_is_no_longer_a_chargeable_status():
+    from app.engines import cost
+
+    # fuse skips must never enter the ledger, so the billing helper is gone
+    assert not hasattr(cost, "chargeable_amount")
+
+
+def test_cost_stops_accumulating_after_fuse_across_runs(isolated_db):
+    # first run under a tight quota: nothing is billed once the fuse trips
+    _set_quota("1.50")
+    first = _run()
+    assert first["report"]["fused"] is True
+    assert first["report"]["cost_total"] == 0.0
+    assert first["report"]["quota_remaining"] == 1.5
+
+    # lifting the quota lets the next run execute and bill normally
+    _set_quota("")
+    second = _run()
+    assert second["report"]["fused"] is False
+    assert second["report"]["succeeded"] == 3
+    assert second["report"]["cost_total"] == 6.0
+    # the fused run contributed zero charges, so the total is only run two's
+    assert _fetchone("SELECT COALESCE(SUM(amount),0) s FROM cost_ledger")["s"] == 6.0
+
+
 def test_old_local_db_migrates_without_data_loss(tmp_path, monkeypatch):
     import sqlite3
 

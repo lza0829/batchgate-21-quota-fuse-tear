@@ -42,13 +42,19 @@ def job_cost(job: dict[str, Any], unit_price: float) -> dict[str, Any]:
 
 
 def quota_gate(*, fused: bool, remaining: float | None, projected: float) -> str:
-    """Decide whether a runnable job may start."""
+    """Decide whether a runnable job may start.
+
+    Once the fuse is latched it never reopens within a run: every later job is
+    blocked with ``fuse_latched`` even if it would still fit the budget.
+    Otherwise a job whose projected cost exceeds the remaining quota trips the
+    fuse via ``would_exceed``.
+    """
+    if fused:
+        return "fuse_latched"
     if remaining is None:
         return "allow"
     if projected > remaining:
         return "would_exceed"
-    if fused and remaining <= 0:
-        return "fuse_latched"
     return "allow"
 
 
@@ -56,10 +62,3 @@ def remaining_after(remaining: float | None, amount: float) -> float | None:
     if remaining is None:
         return None
     return money(remaining - amount)
-
-
-def chargeable_amount(*, status: str, quote: dict[str, Any]) -> float:
-    """Amount to bill for an attempt."""
-    if status in ("success", "skipped_fuse", "failed"):
-        return float(quote.get("amount") or 0.0)
-    return 0.0

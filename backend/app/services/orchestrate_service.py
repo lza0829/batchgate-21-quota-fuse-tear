@@ -4,7 +4,7 @@ from typing import Any
 
 from app.config import FIXTURES_DIR
 from app.db import connect
-from app.engines.cost import chargeable_amount, job_cost, money, quota_gate, remaining_after
+from app.engines.cost import job_cost, money, quota_gate, remaining_after
 from app.engines.dependency import ready_by_upstream_success, topological_layers
 from app.engines.job_runner import run_fixture_job
 from app.repositories import jobs as jobs_repo
@@ -96,7 +96,6 @@ def run_orchestration() -> dict[str, Any]:
             "skipped_fuse": 0,
             "skipped_dep": 0,
         }
-        run_cost = 0.0
         layer_count = 0
         layers = topological_layers(jobs)
 
@@ -105,6 +104,32 @@ def run_orchestration() -> dict[str, Any]:
             for job in layer:
                 attempt_no = 1
                 quote = job_cost(job, cfg["unit_price"])
+
+                # Latch wins over everything: once the quota fuse trips, no
+                # later job in this run may start — regardless of dependencies
+                # or whether it would still fit the remaining budget. The job
+                # is neither executed nor billed and must not move its
+                # watermark.
+                gate = quota_gate(
+                    fused=fused, remaining=remaining, projected=quote["amount"]
+                )
+                if gate == "fuse_latched":
+                    orch_repo.insert_attempt(
+                        conn,
+                        orchestration_id=orch_id,
+                        job_id=job["id"],
+                        attempt_no=attempt_no,
+                        status="skipped_fuse",
+                        detail={
+                            "reason": "quota fuse already latched",
+                            "policy": "skip_on_quota",
+                            "projected_cost": quote["amount"],
+                        },
+                    )
+                    counters["skipped"] += 1
+                    counters["skipped_fuse"] += 1
+                    fused_by.append(job["name"])
+                    continue
 
                 ready, dep_reason = ready_by_upstream_success(
                     job["depends_on"], success_names
@@ -122,50 +147,10 @@ def run_orchestration() -> dict[str, Any]:
                     counters["skipped_dep"] += 1
                     continue
 
-                gate = quota_gate(
-                    fused=fused, remaining=remaining, projected=quote["amount"]
-                )
                 if gate == "would_exceed":
                     fused = True
                     fuse_trigger = job["name"]
-                    try:
-                        result = run_fixture_job(FIXTURES_DIR / job["fixture_path"])
-                    except Exception as exc:  # noqa: BLE001
-                        attempt_id = orch_repo.insert_attempt(
-                            conn,
-                            orchestration_id=orch_id,
-                            job_id=job["id"],
-                            attempt_no=attempt_no,
-                            status="skipped_fuse",
-                            detail={
-                                "reason": (
-                                    "quota would be exceeded: cost "
-                                    f"{quote['amount']:.2f} > remaining {remaining:.2f}"
-                                ),
-                                "policy": "skip_on_quota",
-                                "error": str(exc),
-                                "projected_cost": quote["amount"],
-                            },
-                        )
-                        bill = chargeable_amount(status="skipped_fuse", quote=quote)
-                        ledger_repo.insert_charge(
-                            conn,
-                            orchestration_id=orch_id,
-                            job_id=job["id"],
-                            attempt_id=attempt_id,
-                            amount=bill,
-                            cost_mode=quote["cost_mode"],
-                            cost_weight=quote["cost_weight"],
-                            fixed_cost=quote["fixed_cost"],
-                            unit_price=quote["unit_price"],
-                        )
-                        run_cost = money(run_cost + bill)
-                        counters["skipped"] += 1
-                        counters["skipped_fuse"] += 1
-                        fused_by.append(job["name"])
-                        continue
-
-                    fuse_attempt = orch_repo.insert_attempt(
+                    orch_repo.insert_attempt(
                         conn,
                         orchestration_id=orch_id,
                         job_id=job["id"],
@@ -178,84 +163,11 @@ def run_orchestration() -> dict[str, Any]:
                             ),
                             "policy": "skip_on_quota",
                             "projected_cost": quote["amount"],
-                            "result": result,
                         },
                     )
-                    bill = chargeable_amount(status="skipped_fuse", quote=quote)
-                    ledger_repo.insert_charge(
-                        conn,
-                        orchestration_id=orch_id,
-                        job_id=job["id"],
-                        attempt_id=fuse_attempt,
-                        amount=bill,
-                        cost_mode=quote["cost_mode"],
-                        cost_weight=quote["cost_weight"],
-                        fixed_cost=quote["fixed_cost"],
-                        unit_price=quote["unit_price"],
-                    )
-                    run_cost = money(run_cost + bill)
-                    orch_repo.insert_attempt(
-                        conn,
-                        orchestration_id=orch_id,
-                        job_id=job["id"],
-                        attempt_no=attempt_no + 1,
-                        status="success",
-                        detail={**result, "cost": quote, "paired_fuse": True},
-                    )
-                    wm_repo.set_watermark(
-                        conn, job["id"], result["watermark_ts"], result["artifact_rows"]
-                    )
-                    success_names.add(job["name"])
-                    counters["succeeded"] += 1
                     counters["skipped"] += 1
                     counters["skipped_fuse"] += 1
                     fused_by.append(job["name"])
-                    continue
-
-                if fused and gate != "fuse_latched":
-                    try:
-                        result = run_fixture_job(FIXTURES_DIR / job["fixture_path"])
-                    except Exception as exc:  # noqa: BLE001
-                        orch_repo.insert_attempt(
-                            conn,
-                            orchestration_id=orch_id,
-                            job_id=job["id"],
-                            attempt_no=attempt_no,
-                            status="failed",
-                            detail={"error": str(exc), "billed": False},
-                        )
-                        counters["failed"] += 1
-                        continue
-                    detail = {**result, "cost": quote, "post_fuse": True}
-                    attempt_id = orch_repo.insert_attempt(
-                        conn,
-                        orchestration_id=orch_id,
-                        job_id=job["id"],
-                        attempt_no=attempt_no,
-                        status="success",
-                        detail=detail,
-                    )
-                    bill = chargeable_amount(status="skipped_fuse", quote=quote)
-                    ledger_repo.insert_charge(
-                        conn,
-                        orchestration_id=orch_id,
-                        job_id=job["id"],
-                        attempt_id=attempt_id,
-                        amount=bill,
-                        cost_mode=quote["cost_mode"],
-                        cost_weight=quote["cost_weight"],
-                        fixed_cost=quote["fixed_cost"],
-                        unit_price=quote["unit_price"],
-                    )
-                    wm_repo.set_watermark(
-                        conn, job["id"], result["watermark_ts"], result["artifact_rows"]
-                    )
-                    success_names.add(job["name"])
-                    counters["succeeded"] += 1
-                    counters["skipped_fuse"] += 1
-                    fused_by.append(job["name"])
-                    run_cost = money(run_cost + bill)
-                    remaining = remaining_after(remaining, bill)
                     continue
 
                 try:
@@ -297,7 +209,6 @@ def run_orchestration() -> dict[str, Any]:
                 )
                 success_names.add(job["name"])
                 counters["succeeded"] += 1
-                run_cost = money(run_cost + quote["amount"])
                 remaining = remaining_after(remaining, quote["amount"])
 
         attempts = orch_repo.list_attempts(conn, orch_id)
